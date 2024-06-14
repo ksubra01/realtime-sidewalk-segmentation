@@ -7,3 +7,5 @@ A subset of the dataset used to train can be found here: https://drive.google.co
 Corresponding masks for training can be found here: https://drive.google.com/drive/folders/1WUwgtNWXQXzymrd5oH4vLui--g1qvFBn?usp=sharing
 
 The trained model can be found here: https://drive.google.com/file/d/1b17-TKMuuFXCrnH7uMD7jt4gphmWC8Nm/view?usp=sharing
+
+The weights trained for segmentation can be found here: https://drive.google.com/file/d/1EZBWsVxOELZdLfTgYxJzJzHYTMTkX_9H/view?usp=sharing
