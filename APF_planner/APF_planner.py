@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import imutils
 from scipy.ndimage.morphology import distance_transform_edt as bwdist
 from tqdm import tqdm
+import time
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -23,6 +24,26 @@ transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
+
+execution_times = {
+    'predict': [],
+    'get_contour': [],
+    'goal_from_mask': [],
+    'APF_route': [],
+    'get_commands': [],
+    'draw_segmentation_and_path': [],
+    'gradient_planner': []
+}
+
+def measure_time(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        execution_times[func.__name__].append(end_time - start_time)
+        return result
+    return wrapper
+
 i = 0
 # def get_binary(pr_mask):
 #     global i
@@ -35,23 +56,26 @@ i = 0
 #     cv2.imwrite(f"Binary_image_{i}.png", binary_mask * 255)  # Save binary mask for debugging
 #     i += 1
 #     return binary_mask
-
+@measure_time
 def get_contour(binary_mask):
     thresh = np.array(255 * (1 - binary_mask), dtype=np.uint8)
     cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
     if len(cnts) == 0:
-        return None
+        return None 
     contour = sorted(cnts, key=cv2.contourArea, reverse=True)[0]  # Keep only the largest contour
     return contour
 
-def gradient_planner(f, start_coords, end_coords, max_its):
+@measure_time
+def gradient_planner(f, start_coords, end_coords, max_its, binary_mask):
     [gy, gx] = np.gradient(-f)
+
     route = np.vstack([np.array(start_coords), np.array(start_coords)])
+
     for i in range(max_its):
         current_point = route[-1, :]
         if sum(abs(current_point - end_coords)) < 5.0:
-            #print('Reached the goal !')
+            print('Reached the goal !')
             break
         ix = int(round(current_point[1]))
         iy = int(round(current_point[0]))
@@ -61,50 +85,87 @@ def gradient_planner(f, start_coords, end_coords, max_its):
         vy = gy[ix, iy]
         dt = 1 / np.linalg.norm([vx, vy])
         next_point = current_point + dt * np.array([vx, vy])
+        next_point[1] = min(max(next_point[1], 0), binary_mask.shape[0] - 1)
+        next_point[0] = min(max(next_point[0], 0), binary_mask.shape[1] - 1)
+        midpoint_x = np.mean(np.where(binary_mask[int(next_point[1]), :] == 0))
+        next_point[0] = midpoint_x
         route = np.vstack([route, next_point])
     route = route[1:, :]
 
     return route
 
-def APF_route(binary_mask, goal):
-    d = bwdist(binary_mask == 0)  # The binary mask must be that of obstacles!
+@measure_time
+def APF_route(binary_mask, goal,i):
+    d = bwdist(binary_mask == 0)  # The binary mask must be that of obstacles. The bianry mask s correct.
     d2 = (d / 100.) + 1  # Rescale and transform distances
-    d0 = 1.2             # threshold value for repulsive force 
-    nu = 800             # Scaling factor - How much the robot is push from the obstacles
+    d0 = 1.3 #1.2            # threshold value for repulsive force  - Increase this to increase the repulsive forces in the boundary
+    nu = 500            # Scaling factor - How much the robot is pushed from the obstacles - Increase this to increase the repulsive forces overall
     repulsive = nu * ((1. / d2 - 1 / d0) ** 2)
     repulsive[d2 > d0] = 0
-
+    # print("repulsive is", repulsive)
     drivable_indexes = np.asarray(np.where(binary_mask == 0))
-    start_y = np.min(drivable_indexes[0, :])
-    start_x = np.mean(drivable_indexes[1, np.where(drivable_indexes[0, :] == start_y)])
+    if drivable_indexes.size !=0:
+        
+        start_y = np.max(drivable_indexes[0, :]) ##3 Changed to max
+        start_x = np.mean(drivable_indexes[1, np.where(drivable_indexes[0, :] == start_y)])
+    else:
+        start_x, start_y = 0,0
+    if start_x > 210:
+        start_x = 210
     start = [start_x, start_y]
     nrows, ncols = binary_mask.shape
     [x, y] = np.meshgrid(np.arange(ncols), np.arange(nrows))
-    xi = 1 / 700.
+    xi = 1 / 700.   # Changed from 700
     attractive = xi * ((x - goal[0]) ** 2 + (y - goal[1]) ** 2)
 
     f = attractive + repulsive
 
-    route = gradient_planner(f, start, goal, 700)
+    # if i%500 == 0:
+
+
+    #     print("Start is", start)
+    #     print("Goal is", goal)
+    #     plt.figure()
+    #     plt.imshow(binary_mask)
+    #     plt.title("Binary mask")
+    #     plt.show()
+
+    #     plt.figure()
+    #     plt.imshow(f, cmap='hot')
+    #     plt.title("Potential Field")
+    #     plt.colorbar()
+    #     plt.show()
+
+
+
+    route = gradient_planner(f, start, goal, 700, binary_mask)
     return route
 
-def goal_from_mask(binary_mask):
+@measure_time
+def goal_from_mask(binary_mask,i):
     drivable_indexes = np.asarray(np.where(binary_mask == 0))
-    if len(drivable_indexes) !=0:
-        farest_y = np.max(drivable_indexes[0, :])
-        farest_id = np.where(drivable_indexes[0, :] == farest_y)[0][0]
-        farest_x = drivable_indexes[1, farest_id]
 
-        farest_x += 5
-        farest_y += 5
-        goal = [farest_x, farest_y]
-
-    #print("Goal coordinates", goal)
-
+    if drivable_indexes.size == 0:
+        print("Frame number is:", i)
+        plt.imshow(binary_mask)
+        plt.title("binary mask when d index is zero")
+        plt.show()
+        goal = [0,0]
         return goal
-    else:
-        return [0,0]
+    # if drivable_indexes.size != 0:
+    farest_y = np.min(drivable_indexes[0, :]) ### Changed to min
+    farest_id = np.where(drivable_indexes[0, :] == farest_y)[0][0]
+    farest_x = drivable_indexes[1, farest_id]
 
+    goal = [farest_x, farest_y]
+    #else:
+    #goal = [0, 0]  # Default goal if no drivable area is found
+
+    # print("Goal coordinates", goal)
+
+    return goal
+
+@measure_time
 def get_commands(binary_mask, route):
     _, w = binary_mask.shape
     route_int = np.asarray(route, dtype=np.int)
@@ -119,13 +180,14 @@ def get_commands(binary_mask, route):
 
     return vel, omega
 
+@measure_time
 def draw_segmentation_and_path(frame, mask, route, goal):
     overlay = frame.copy()
     overlay[mask == 1] = [0, 255, 0]  # Green color for the mask
     if route is not None:
         for point in route:
             cv2.circle(overlay, (int(point[0]), int(point[1])), 2, (255, 0, 0), -1)  # Blue color for the route
-        cv2.circle(overlay, (int(goal[0]), int(goal[1])), 5, (0, 0, 255), -1)  # Red color for the goal
+        cv2.circle(overlay, (int(goal[0]), int(goal[1])), 5, (0, 255, 255), -1)  # Red color for the goal
     blended = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
     return blended
 
@@ -142,17 +204,21 @@ def process_video(input_video_path, output_video_path, roi_coords):
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    for _ in tqdm(range(frame_count)):
+    for i in tqdm(range(frame_count)):
         ret, frame = cap.read()
         if not ret:
             break
 
         pred_mask = predict(model, frame, device)
-        # cv2.imshow("Pred_mask is", pred_mask)
-        # cv2.waitKey(0)
+        # plt.figure()
+        # plt.imshow(pred_mask)
+        # plt.show()
+
         pred_mask_resized = cv2.resize(pred_mask, (frame.shape[1], frame.shape[0]))
-        # cv2.imshow("Resized mask", pred_mask_resized)
-        # cv2.waitKey(0)        
+        # plt.figure()
+        # plt.imshow(pred_mask_resized)
+        # plt.show()
+       
         roi_mask = pred_mask_resized[roi_coords[1]:roi_coords[3], roi_coords[0]:roi_coords[2]]
 
         # plt.figure()
@@ -172,12 +238,13 @@ def process_video(input_video_path, output_video_path, roi_coords):
             cv2.drawContours(contour_mask, [contour], -1, 1, thickness=cv2.FILLED)
             # plt.figure()
             # plt.imshow(contour_mask)
+            # plt.title("the contour map is")
 
             # plt.show()
 
 
-            goal = goal_from_mask(contour_mask)
-            route = APF_route(contour_mask, goal)
+            goal = goal_from_mask(contour_mask,i)
+            route = APF_route(contour_mask, goal,i)
             if route is not None:
                 route = route + np.array([roi_coords[0], roi_coords[1]])
         else:
@@ -186,17 +253,22 @@ def process_video(input_video_path, output_video_path, roi_coords):
 
 
         result_frame = draw_segmentation_and_path(frame, pred_mask_resized, route, goal)
-        # plt.figure()
-        # plt.imshow(result_frame)
-        # plt.title("Frame")
-        # plt.axis('off')
-        # plt.show()
+        # if i%500 ==0 :
+        #     plt.figure()
+        #     plt.imshow(result_frame)
+        #     plt.title("Frame")
+        #     plt.axis('off')
+        #     plt.show()
         out.write(result_frame)
+
+        # if i == 100:
+        #     break
 
     cap.release()
     out.release()
     print(f"Processed video saved as {output_video_path}")
 
+@measure_time
 def predict(model, frame, device):
     model.eval()
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -212,8 +284,27 @@ def predict(model, frame, device):
     return output
 
 # Example usage
-input_video_path = "E:/snowbotix_small_2.mp4"
-output_video_path = 'OM_SAI_RAM.mp4'
-roi_coords = (300, 360, 600, 481)  # (x1, y1, x2, y2)
+input_video_path = "E:/snowbotix_edit.mp4"
+output_video_path = 'APF_Planner_final.mp4'
+roi_coords = (128, 360, 574, 481)  # (x1, y1, x2, y2)
+
+
+
+def plot_execution_times(execution_times):
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    for func_name, times in execution_times.items():
+        ax.plot(times, label=func_name)
+
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Execution Time (s)')
+    ax.set_title('Execution Time per Function per Frame')
+    ax.legend()
+    plt.show()
+
+
+
 
 process_video(input_video_path, output_video_path, roi_coords)
+
+plot_execution_times(execution_times)
